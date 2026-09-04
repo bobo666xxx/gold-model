@@ -7,7 +7,7 @@ from fredapi import Fred
 # =========================
 # 配置
 # =========================
-FRED_API_KEY = "你的FRED_API_KEY"  # ← 替换成你自己的
+FRED_API_KEY = st.secrets["FRED_API_KEY"]  # ← 替换成你自己的
 
 # 更新权重方案，加入新因子
 WEIGHT_GRID = {

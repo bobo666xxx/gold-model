@@ -1,335 +1,396 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from fredapi import Fred
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
 
-# =========================
-# 配置
-# =========================
-FRED_API_KEY = "你的FRED_API_KEY"  # ← 替换成你自己的
+# ============================================================
+# 页面配置
+# ============================================================
+st.set_page_config(page_title="黄金走势多因子分析模型", page_icon="", layout="wide")
 
-# 更新权重方案，加入新因子
-WEIGHT_GRID = {
-    "均衡权重": {
-        "real_rate": -0.20,
-        "usd": -0.15,
-        "inflation": 0.10,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.15,
-        "central_bank": 0.20,  # 央行购金
-        "fiscal_deficit": 0.20, # 财政赤字
-    },
-    "宏观债务主导": {
-        "real_rate": -0.15,
-        "usd": -0.10,
-        "inflation": 0.10,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.10,
-        "central_bank": 0.20,
-        "fiscal_deficit": 0.45, # 极度看重债务问题
-    },
-    "传统宏观主导": {
-        "real_rate": -0.40,
-        "usd": -0.30,
-        "inflation": 0.15,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.05,
-        "central_bank": 0.00,
-        "fiscal_deficit": 0.00,
-    },
-}
+# ============================================================
+# 数据获取模块（全部免费，无需 API Key）
+# ============================================================
 
-# =========================
-# 数据获取
-# =========================
-@st.cache_data(ttl=3600)
-def fetch_all_data(api_key: str) -> pd.DataFrame:
-    fred = Fred(api_key=api_key)
-    series_map = {
-        "gold": "GOLDAMGBD228NLBM",
-        "real_rate": "REAINTRATREARAT10Y",
-        "usd": "DTWEXBGS",
-        "cpi": "CPIAUCSL",
-        "unemployment": "UNRATE",
-        "nonfarm": "PAYEMS",
-        "gdp": "GDP",
-        "vix": "VIXCLS",
-        # 新增因子代码
-        "central_bank_gold": "WOGOLD", # 全球央行黄金储备 (吨)
-        "fiscal_deficit": "FYFSD",     # 美国财政赤字 (十亿美元，负值表示赤字)
+@st.cache_data(ttl=300)
+def fetch_market_data():
+    """从 Yahoo Finance 获取市场数据"""
+    try:
+        tickers = {
+            "gold": "GC=F",          # COMEX 黄金期货
+            "dxy": "DX-Y.NYB",       # 美元指数
+            "us10y": "^TNX",          # 美国10年期国债收益率
+            "us2y": "^IRX",           # 美国短期国债收益率（近似）
+            "sp500": "^GSPC",         # 标普500
+            "vix": "^VIX",            # 恐慌指数
+            "silver": "SI=F",         # 白银
+            "oil": "CL=F",            # 原油
+            "btc": "BTC-USD",         # 比特币（风险偏好参考）
+        }
+        data = {}
+        for name, ticker in tickers.items():
+            try:
+                tk = yf.Ticker(ticker)
+                hist = tk.history(period="6mo")
+                if not hist.empty:
+                    data[name] = hist
+            except Exception:
+                continue
+        return data
+    except Exception as e:
+        st.error(f"数据获取异常: {e}")
+        return {}
+
+
+@st.cache_data(ttl=300)
+def fetch_cpi_data():
+    """从 FRED 公开页面获取 CPI 数据（无需 Key）"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        df['CPI_YoY'] = df['CPIAUCSL'].pct_change(12) * 100
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_unemployment_data():
+    """从 FRED 获取失业率数据"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_fed_funds_rate():
+    """获取联邦基金利率"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=FEDFUNDS"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_nonfarm_payrolls():
+    """获取非农就业数据"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=PAYEMS"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        df['NFP_Change'] = df['PAYEMS'].diff()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_retail_sales():
+    """获取零售销售数据（消费指数代理）"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=RSXFSN"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_industrial_production():
+    """获取工业生产指数"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=INDPRO"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def fetch_us_debt():
+    """获取美国国债总额"""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=GFDEBTN"
+        df = pd.read_csv(url)
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df = df.set_index('DATE').sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ============================================================
+# 多因子评分引擎
+# ============================================================
+
+def calculate_factor_scores(market_data, cpi_df, unemp_df, fed_df, nfp_df, retail_df, indprod_df, debt_df):
+    """计算各因子对黄金的评分（-100 到 +100，正=利多，负=利空）"""
+    scores = {}
+    details = {}
+
+    # 1. 美元指数因子（负相关）
+    if "dxy" in market_data and len(market_data["dxy"]) > 20:
+        dxy = market_data["dxy"]["Close"]
+        dxy_chg_1m = (dxy.iloc[-1] / dxy.iloc[-22] - 1) * 100 if len(dxy) > 22 else 0
+        dxy_chg_3m = (dxy.iloc[-1] / dxy.iloc[-66] - 1) * 100 if len(dxy) > 66 else 0
+        # 美元走弱利多黄金
+        score = np.clip(-dxy_chg_1m * 15, -100, 100)
+        scores["美元指数"] = score
+        details["美元指数"] = f"1月变动: {dxy_chg_1m:+.2f}% | 3月变动: {dxy_chg_3m:+.2f}% | 当前: {dxy.iloc[-1]:.2f}"
+    else:
+        scores["美元指数"] = 0
+        details["美元指数"] = "数据不可用"
+
+    # 2. 实际利率因子（负相关）
+    if "us10y" in market_data and len(cpi_df) > 0:
+        us10y = market_data["us10y"]["Close"].iloc[-1]
+        cpi_yoy = cpi_df["CPI_YoY"].dropna().iloc[-1] if not cpi_df["CPI_YoY"].dropna().empty else 3.0
+        real_rate = us10y - cpi_yoy
+        # 实际利率越低越利多黄金
+        if real_rate < 0:
+            score = np.clip(abs(real_rate) * 20, 0, 100)
+        else:
+            score = np.clip(-real_rate * 15, -100, 0)
+        scores["实际利率"] = score
+        details["实际利率"] = f"10Y国债: {us10y:.2f}% | CPI同比: {cpi_yoy:.2f}% | 实际利率: {real_rate:.2f}%"
+    else:
+        scores["实际利率"] = 0
+        details["实际利率"] = "数据不可用"
+
+    # 3. 通胀因子（正相关）
+    if len(cpi_df) > 0:
+        cpi_yoy = cpi_df["CPI_YoY"].dropna()
+        if not cpi_yoy.empty:
+            current_cpi = cpi_yoy.iloc[-1]
+            cpi_trend = cpi_yoy.iloc[-1] - cpi_yoy.iloc[-2] if len(cpi_yoy) > 1 else 0
+            # 通胀上升利多黄金
+            score = np.clip((current_cpi - 2.0) * 25 + cpi_trend * 10, -100, 100)
+            scores["通胀数据"] = score
+            details["通胀数据"] = f"CPI同比: {current_cpi:.2f}% | 趋势: {'上升' if cpi_trend > 0 else '下降'}({cpi_trend:+.2f}%)"
+        else:
+            scores["通胀数据"] = 0
+            details["通胀数据"] = "数据不足"
+    else:
+        scores["通胀数据"] = 0
+        details["通胀数据"] = "数据不可用"
+
+    # 4. 就业数据因子（非农低于预期利多黄金）
+    if len(nfp_df) > 2:
+        nfp_change = nfp_df["NFP_Change"].dropna()
+        if not nfp_change.empty:
+            latest_nfp = nfp_change.iloc[-1]
+            avg_nfp = nfp_change.iloc[-12:].mean() if len(nfp_change) >= 12 else nfp_change.mean()
+            deviation = latest_nfp - avg_nfp
+            # 非农低于均值利多黄金（经济放缓→降息预期）
+            score = np.clip(-deviation / 50, -100, 100)
+            scores["就业数据"] = score
+            details["就业数据"] = f"最新非农变动: {latest_nfp:+.0f}K | 12月均值: {avg_nfp:+.0f}K | 偏差: {deviation:+.0f}K"
+        else:
+            scores["就业数据"] = 0
+            details["就业数据"] = "数据不足"
+    else:
+        scores["就业数据"] = 0
+        details["就业数据"] = "数据不可用"
+
+    # 5. 失业率因子（失业率上升利多黄金）
+    if len(unemp_df) > 0:
+        unemp = unemp_df["UNRATE"].dropna()
+        if not unemp.empty:
+            current_unemp = unemp.iloc[-1]
+            unemp_chg = unemp.iloc[-1] - unemp.iloc[-2] if len(unemp) > 1 else 0
+            # 失业率上升利多黄金
+            score = np.clip((current_unemp - 3.5) * 30 + unemp_chg * 50, -100, 100)
+            scores["失业率"] = score
+            details["失业率"] = f"当前: {current_unemp:.1f}% | 变动: {unemp_chg:+.2f}%"
+        else:
+            scores["失业率"] = 0
+            details["失业率"] = "数据不足"
+    else:
+        scores["失业率"] = 0
+        details["失业率"] = "数据不可用"
+
+    # 6. 美联储利率因子
+    if len(fed_df) > 0:
+        fed_rate = fed_df["FEDFUNDS"].dropna()
+        if not fed_rate.empty:
+            current_rate = fed_rate.iloc[-1]
+            rate_chg = fed_rate.iloc[-1] - fed_rate.iloc[-2] if len(fed_rate) > 1 else 0
+            # 降息周期利多黄金
+            if rate_chg < 0:
+                score = np.clip(abs(rate_chg) * 40, 0, 100)
+            elif rate_chg > 0:
+                score = np.clip(-abs(rate_chg) * 40, -100, 0)
+            else:
+                score = 20  # 维持不变偏中性偏多
+            scores["美联储利率"] = score
+            details["美联储利率"] = f"联邦基金利率: {current_rate:.2f}% | 最近变动: {rate_chg:+.2f}%"
+        else:
+            scores["美联储利率"] = 0
+            details["美联储利率"] = "数据不足"
+    else:
+        scores["美联储利率"] = 0
+        details["美联储利率"] = "数据不可用"
+
+    # 7. 消费指数因子（消费疲软利多黄金）
+    if len(retail_df) > 0:
+        retail = retail_df["RSXFSN"].dropna()
+        if len(retail) > 12:
+            retail_chg = (retail.iloc[-1] / retail.iloc[-13] - 1) * 100
+            # 消费疲软利多黄金
+            score = np.clip(-retail_chg * 10, -100, 100)
+            scores["消费指数"] = score
+            details["消费指数"] = f"零售销售12月变动: {retail_chg:+.2f}%"
+        else:
+            scores["消费指数"] = 0
+            details["消费指数"] = "数据不足"
+    else:
+        scores["消费指数"] = 0
+        details["消费指数"] = "数据不可用"
+
+    # 8. 工业生产指数因子
+    if len(indprod_df) > 0:
+        indprod = indprod_df["INDPRO"].dropna()
+        if len(indprod) > 12:
+            indprod_chg = (indprod.iloc[-1] / indprod.iloc[-13] - 1) * 100
+            # 工业产出下降利多黄金（经济放缓）
+            score = np.clip(-indprod_chg * 10, -100, 100)
+            scores["生产指数"] = score
+            details["生产指数"] = f"工业生产12月变动: {indprod_chg:+.2f}%"
+        else:
+            scores["生产指数"] = 0
+            details["生产指数"] = "数据不足"
+    else:
+        scores["生产指数"] = 0
+        details["生产指数"] = "数据不可用"
+
+    # 9. VIX恐慌指数因子（正相关，避险）
+    if "vix" in market_data and len(market_data["vix"]) > 5:
+        vix = market_data["vix"]["Close"]
+        current_vix = vix.iloc[-1]
+        vix_avg = vix.iloc[-22:].mean() if len(vix) > 22 else vix.mean()
+        # VIX高利多黄金
+        score = np.clip((current_vix - 20) * 3, -100, 100)
+        scores["地缘/避险(VIX)"] = score
+        details["地缘/避险(VIX)"] = f"VIX当前: {current_vix:.1f} | 20日均值: {vix_avg:.1f}"
+    else:
+        scores["地缘/避险(VIX)"] = 0
+        details["地缘/避险(VIX)"] = "数据不可用"
+
+    # 10. 央行购金（基于黄金ETF资金流代理 + 金银比）
+    if "gold" in market_data and "silver" in market_data:
+        gold_price = market_data["gold"]["Close"].iloc[-1]
+        silver_price = market_data["silver"]["Close"].iloc[-1]
+        gold_silver_ratio = gold_price / silver_price if silver_price > 0 else 80
+        # 金银比偏高说明避险需求强
+        score = np.clip((gold_silver_ratio - 80) * 2, -100, 100)
+        scores["央行购金/避险需求"] = score
+        details["央行购金/避险需求"] = f"金银比: {gold_silver_ratio:.1f} | 黄金: ${gold_price:.2f} | 白银: ${silver_price:.2f}"
+    else:
+        scores["央行购金/避险需求"] = 0
+        details["央行购金/避险需求"] = "数据不可用"
+
+    # 11. 美国负债因子（正相关）
+    if len(debt_df) > 0:
+        debt = debt_df["GFDEBTN"].dropna()
+        if len(debt) > 4:
+            debt_latest = debt.iloc[-1]
+            debt_chg = (debt.iloc[-1] / debt.iloc[-2] - 1) * 100 if len(debt) > 1 else 0
+            # 债务持续增长利多黄金
+            score = np.clip(debt_chg * 5 + 30, -100, 100)  # 基础偏多，因为美国债务长期增长
+            scores["美国负债"] = score
+            details["美国负债"] = f"国债总额: ${debt_latest/1e9:.0f}B | 季度变动: {debt_chg:+.2f}%"
+        else:
+            scores["美国负债"] = 0
+            details["美国负债"] = "数据不足"
+    else:
+        scores["美国负债"] = 0
+        details["美国负债"] = "数据不可用"
+
+    return scores, details
+
+
+def calculate_composite_score(scores):
+    """计算加权综合评分"""
+    weights = {
+        "美元指数": 0.15,
+        "实际利率": 0.18,
+        "通胀数据": 0.12,
+        "就业数据": 0.10,
+        "失业率": 0.08,
+        "美联储利率": 0.12,
+        "消费指数": 0.05,
+        "生产指数": 0.05,
+        "地缘/避险(VIX)": 0.05,
+        "央行购金/避险需求": 0.05,
+        "美国负债": 0.05,
     }
-    frames = {}
-    for name, sid in series_map.items():
-        try:
-            s = fred.get_series(sid)
-            s.name = name
-            frames[name] = s
-        except Exception as e:
-            st.warning(f"获取 {name} 失败: {e}")
-    
-    # 合并数据，按日期对齐
-    df = pd.concat(frames.values(), axis=1).dropna()
-    return df
+    total_weight = 0
+    weighted_sum = 0
+    for factor, score in scores.items():
+        w = weights.get(factor, 0.05)
+        weighted_sum += score * w
+        total_weight += w
+    return weighted_sum / total_weight if total_weight > 0 else 0
 
-# =========================
-# 因子计算
-# =========================
-def compute_factors(df: pd.DataFrame) -> pd.DataFrame:
-    factors = pd.DataFrame(index=df.index)
-    
-    # 1. 传统因子
-    factors["real_rate"] = -df["real_rate"] # 实际利率反向
-    factors["usd"] = -df["usd"].pct_change(60) # 美元60日跌幅
-    factors["inflation"] = df["cpi"].pct_change(12) # 通胀同比
-    factors["employment"] = -df["unemployment"].diff() + df["nonfarm"].pct_change() # 就业恶化程度
-    factors["economic_activity"] = df["gdp"].pct_change(4) # GDP增速
-    factors["market_sentiment"] = -df["vix"].pct_change(20) # 恐慌指数变化（通常VIX涨利好黄金，但这里取变化率平滑）
-    
-    # 2. 新增因子
-    # 央行购金：计算同比变化率，购金增加利好黄金
-    factors["central_bank"] = df["central_bank_gold"].pct_change(12)
-    
-    # 财政赤字：FRED数据中FYFSD通常是负数表示赤字。
-    # 逻辑：赤字扩大（数值更负）-> 利好黄金。
-    # 处理：取相反数，使赤字扩大时因子值为正。
-    factors["fiscal_deficit"] = -df["fiscal_deficit"].pct_change(4) # 4季度变化率
-    
-    return factors.dropna()
 
-def zscore(s: pd.Series, window: int = 180) -> pd.Series:
-    return (s - s.rolling(window, min_periods=24).mean()) / s.rolling(window, min_periods=24).std()
-
-def build_signal(factors: pd.DataFrame, weights: dict, window: int = 180) -> pd.DataFrame:
-    z = factors.apply(zscore, window=window)
-    # 确保权重字典只包含因子中存在的列
-    valid_weights = {k: v for k, v in weights.items() if k in z.columns}
-    score = sum(z[k] * v for k, v in valid_weights.items())
-    
-    out = factors[["gold"]].copy()
-    out["gold_ret"] = out["gold"].pct_change()
-    out["score"] = score
-    return out.dropna()
-
-# =========================
-# 回测引擎
-# =========================
-def simple_backtest(base: pd.DataFrame, threshold: float = 0.5):
-    sig = np.where(base["score"] > threshold, 1, np.where(base["score"] < -threshold, -1, 0))
-    pos = pd.Series(sig, index=base.index).replace(0, method="ffill").fillna(0)
-    strat_ret = pos.shift(1) * base["gold_ret"]
-    equity = (1 + strat_ret).cumprod()
-    trades = strat_ret[strat_ret != 0]
-    return {"equity": equity, "trades": trades, "positions": pos}
-
-def calc_metrics(equity: pd.Series, trades: pd.Series):
-    total_ret = equity.iloc[-1] / equity.iloc[0] - 1
-    sharpe = trades.mean() / trades.std() * np.sqrt(252) if trades.std() > 0 else 0
-    max_dd = (equity / equity.cummax() - 1).min()
-    win_rate = (trades > 0).mean() if len(trades) > 0 else 0
-    return {"累计收益": total_ret, "Sharpe": sharpe, "最大回撤": max_dd, "胜率": win_rate}
-
-# =========================
-# 智能分析报告生成器
-# =========================
-def generate_analysis_report(base: pd.DataFrame, metrics: dict, weights: dict):
-    if base.empty or not metrics:
-        return "数据不足，无法生成分析报告。"
-
-    latest_score = base["score"].iloc[-1]
-    latest_date = base.index[-1].strftime("%Y-%m-%d")
-    latest_gold = base["gold"].iloc[-1]
-
-    # 1. 趋势诊断
-    if latest_score > 1.0:
-        trend = "🔥 **强势多头趋势**"
-        trend_desc = "综合得分显著高于历史均值，宏观与新因子共振强烈支撑黄金。"
-    elif latest_score > 0.5:
-        trend = "📈 **温和偏多趋势**"
-        trend_desc = "综合得分处于偏多区间，具备上行动能。"
-    elif latest_score > -0.5:
-        trend = "⚖️ **中性震荡趋势"
-        trend_desc = "多空力量均衡，可能维持区间震荡。"
-    elif latest_score > -1.0:
-        trend = "📉 **温和偏空趋势**"
-        trend_desc = "综合得分处于偏空区间，宏观环境形成压制。"
+def get_signal(composite_score):
+    """根据综合评分给出信号"""
+    if composite_score > 50:
+        return "🟢 强烈看多", "green"
+    elif composite_score > 20:
+        return "🟢 偏多", "limegreen"
+    elif composite_score > -20:
+        return "🟡 中性震荡", "gold"
+    elif composite_score > -50:
+        return " 偏空", "orange"
     else:
-        trend = "❄️ **强势空头趋势**"
-        trend_desc = "综合得分极低，市场情绪悲观或实际利率大幅走高。"
+        return " 强烈看空", "red"
 
-    # 2. 核心驱动因子分析
-    # 重新计算Z-score用于解释
-    factors_only = base.drop(columns=["gold", "gold_ret", "score"])
-    z = (factors_only - factors_only.rolling(180, min_periods=24).mean()) / factors_only.rolling(180, min_periods=24).std()
-    
-    latest_z = z.iloc[-1]
-    valid_weights = {k: v for k, v in weights.items() if k in latest_z.index}
-    contributions = latest_z * pd.Series(valid_weights)
-    
-    top_positive = contributions.nlargest(2)
-    top_negative = contributions.nsmallest(2)
 
-    driver_analysis = "**主要多头贡献：**\n"
-    has_pos = False
-    for factor, val in top_positive.items():
-        if val > 0:
-            driver_analysis += f"- 🟢 **{factor}** (贡献度: +{val:.3f})\n"
-            has_pos = True
-    if not has_pos: driver_analysis += "- 无明显正向驱动\n"
+def generate_report(scores, details, composite, signal, market_data):
+    """生成分析报告"""
+    report = []
+    report.append("=" * 50)
+    report.append(" 黄金走势多因子分析报告")
+    report.append(f" 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    report.append("=" * 50)
+    report.append("")
 
-    driver_analysis += "\n**主要空头拖累：**\n"
-    has_neg = False
-    for factor, val in top_negative.items():
-        if val < 0:
-            driver_analysis += f"- 🔴 **{factor}** (贡献度: {val:.3f})\n"
-            has_neg = True
-    if not has_neg: driver_analysis += "- 无明显负向拖累\n"
+    # 当前金价
+    if "gold" in market_data:
+        gold_price = market_data["gold"]["Close"].iloc[-1]
+        gold_chg = (market_data["gold"]["Close"].iloc[-1] / market_data["gold"]["Close"].iloc[-2] - 1) * 100
+        report.append(f" 当前金价: ${gold_price:.2f}/盎司 ({gold_chg:+.2f}%)")
+    report.append(f" 综合评分: {composite:+.1f} / 100")
+    report.append(f" 趋势信号: {signal}")
+    report.append("")
+    report.append("-" * 50)
+    report.append(" 各因子评分明细:")
+    report.append("-" * 50)
 
-    # 3. 策略表现评估
-    sharpe = metrics.get("Sharpe", 0)
-    max_dd = metrics.get("最大回撤", 0)
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    for factor
 
-    if sharpe > 1.5 and max_dd > -0.15:
-        strategy_rating = "🌟 **优秀**：风险收益比极佳。"
-    elif sharpe > 0.8:
-        strategy_rating = "👍 **良好**：表现稳健。"
-    elif sharpe > 0:
-        strategy_rating = "⚠️ **一般**：收益勉强覆盖风险。"
-    else:
-        strategy_rating = "❌ **较差**：策略失效。"
-
-    # 4. 综合建议
-    if latest_score > 0.5 and sharpe > 0.8:
-        advice = "💡 **操作参考**：趋势向上且策略有效，可考虑逢低做多。"
-    elif latest_score < -0.5:
-        advice = "💡 **操作参考**：趋势向下，建议规避多头风险。"
-    else:
-        advice = "💡 **操作参考**：信号不明确，建议观望。"
-
-    report = f"""
-### 📊 黄金多因子智能分析报告 ({latest_date})
-
-**1. 市场趋势诊断**
-- **当前状态**：{trend}
-- **状态解析**：{trend_desc}
-- **最新金价**：${latest_gold:.2f} | **综合得分**：{latest_score:.3f}
-
-**2. 核心驱动因子分析**
-{driver_analysis}
-
-**3. 历史回测策略评估**
-- **累计收益**：{metrics.get('累计收益', 0):.2%} | **胜率**：{metrics.get('胜率', 0):.2%}
-- **策略评级**：{strategy_rating}
-
-**4. 综合操作建议**
-{advice}
-
-> ⚠️ *免责声明：本报告由量化模型自动生成，仅供研究参考。*
-"""
-    return report
-
-# =========================
-# 绘图
-# =========================
-def plot_signal(base: pd.DataFrame):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-    axes[0].plot(base.index, base["gold"], color="gold", linewidth=1.5)
-    axes[0].set_title("Gold Price", color="white")
-    axes[0].set_facecolor("#1a1a2e")
-    axes[0].tick_params(colors="white")
-    
-    axes[1].plot(base.index, base["score"], color="cyan", linewidth=1.2)
-    axes[1].axhline(0.5, color="lime", ls="--", lw=0.8)
-    axes[1].axhline(-0.5, color="red", ls="--", lw=0.8)
-    axes[1].fill_between(base.index, base["score"], 0, where=base["score"] > 0, alpha=0.3, color="lime")
-    axes[1].fill_between(base.index, base["score"], 0, where=base["score"] < 0, alpha=0.3, color="red")
-    axes[1].set_title("Composite Score", color="white")
-    axes[1].set_facecolor("#1a1a2e")
-    axes[1].tick_params(colors="white")
-    
-    fig.patch.set_facecolor("#0e1117")
-    plt.tight_layout()
-    return fig
-
-def plot_backtest(result: dict):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-    axes[0].plot(result["equity"].index, result["equity"], color="lime", linewidth=1.5)
-    axes[0].set_title("Equity Curve", color="white")
-    axes[0].set_facecolor("#1a1a2e")
-    axes[0].tick_params(colors="white")
-    
-    dd = result["equity"] / result["equity"].cummax() - 1
-    axes[1].fill_between(dd.index, dd, 0, color="red", alpha=0.5)
-    axes[1].set_title("Drawdown", color="white")
-    axes[1].set_facecolor("#1a1a2e")
-    axes[1].tick_params(colors="white")
-    
-    fig.patch.set_facecolor("#0e1117")
-    plt.tight_layout()
-    return fig
-
-# =========================
-# 主程序
-# =========================
-def main():
-    st.set_page_config(page_title="Gold Factor Model Pro", layout="wide")
-    st.title("🏆 黄金多因子量化分析系统 (含央行与赤字因子)")
-
-    with st.sidebar:
-        st.header("参数设置")
-        api_key = st.text_input("FRED API Key", value=FRED_API_KEY, type="password")
-        weight_scheme = st.selectbox("权重方案", list(WEIGHT_GRID.keys()))
-        threshold = st.slider("信号阈值", -1.0, 1.0, 0.5, 0.1)
-        run = st.button("🚀 运行分析", type="primary")
-
-    if run and api_key:
-        with st.spinner("正在获取数据并计算..."):
-            raw = fetch_all_data(api_key)
-            factors = compute_factors(raw)
-            weights = WEIGHT_GRID[weight_scheme]
-            base = build_signal(factors, weights)
-            result = simple_backtest(base, threshold)
-            metrics = calc_metrics(result["equity"], result["trades"])
-            st.session_state.update({
-                "base": base, "result": result,
-                "metrics": metrics, "weights": weights,
-            })
-
-    if "base" in st.session_state:
-        base = st.session_state["base"]
-        metrics = st.session_state["metrics"]
-        weights = st.session_state["weights"]
-        latest_score = base["score"].iloc[-1]
-        signal_text = "🟢 偏多" if latest_score > threshold else "🔴 偏空" if latest_score < -threshold else "⚪ 中性"
-
-        # 指标卡片
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("综合得分", f"{latest_score:.3f}")
-        col2.metric("信号方向", signal_text)
-        col3.metric("最新金价", f"${base['gold'].iloc[-1]:.2f}")
-        col4.metric("Sharpe", f"{metrics['Sharpe']:.2f}")
-
-        # 智能分析报告
-        st.markdown("---")
-        report_text = generate_analysis_report(base, metrics, weights)
-        st.markdown(report_text)
-
-        # 图表
-        st.markdown("---")
-        st.subheader("信号走势图")
-        fig_signal = plot_signal(base)
-        st.pyplot(fig_signal)
-
-        st.subheader("回测净值与回撤")
-        fig_bt = plot_backtest(st.session_state["result"])
-        st.pyplot(fig_bt)
-
-        # 回测指标表
-        st.subheader("回测指标")
-        st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "数值"}))
-
-if __name__ == "__main__":
-    main()
+[(doc_common_card_1)]

@@ -46,7 +46,7 @@ def fetch_all_data():
 @st.cache_data(ttl=3600)
 def build_analysis_df(data):
     """构建因子分析 DataFrame"""
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(data, index=[0])
     df = df.dropna()
 
     # 计算各因子的日收益率

@@ -1,335 +1,317 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import matplotlib.pyplot as plt
-from fredapi import Fred
+import seaborn as sns
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+warnings.filterwarnings("ignore")
 
-# =========================
-# 配置
-# =========================
-FRED_API_KEY = st.secrets["FRED_API_KEY"]  # ← 替换成你自己的
+# ==========================================
+# 页面配置
+# ==========================================
+st.set_page_config(page_title="黄金多因子趋势分析", layout="wide")
 
-# 更新权重方案，加入新因子
-WEIGHT_GRID = {
-    "均衡权重": {
-        "real_rate": -0.20,
-        "usd": -0.15,
-        "inflation": 0.10,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.15,
-        "central_bank": 0.20,  # 央行购金
-        "fiscal_deficit": 0.20, # 财政赤字
-    },
-    "宏观债务主导": {
-        "real_rate": -0.15,
-        "usd": -0.10,
-        "inflation": 0.10,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.10,
-        "central_bank": 0.20,
-        "fiscal_deficit": 0.45, # 极度看重债务问题
-    },
-    "传统宏观主导": {
-        "real_rate": -0.40,
-        "usd": -0.30,
-        "inflation": 0.15,
-        "employment": 0.05,
-        "economic_activity": 0.05,
-        "market_sentiment": 0.05,
-        "central_bank": 0.00,
-        "fiscal_deficit": 0.00,
-    },
-}
-
-# =========================
-# 数据获取
-# =========================
+# ==========================================
+# 数据获取（全部免费，无需 Key）
+# ==========================================
 @st.cache_data(ttl=3600)
-def fetch_all_data(api_key: str) -> pd.DataFrame:
-    fred = Fred(api_key=api_key)
-    series_map = {
-        "gold": "GOLDAMGBD228NLBM",
-        "real_rate": "REAINTRATREARAT10Y",
-        "usd": "DTWEXBGS",
-        "cpi": "CPIAUCSL",
-        "unemployment": "UNRATE",
-        "nonfarm": "PAYEMS",
-        "gdp": "GDP",
-        "vix": "VIXCLS",
-        # 新增因子代码
-        "central_bank_gold": "WOGOLD", # 全球央行黄金储备 (吨)
-        "fiscal_deficit": "FYFSD",     # 美国财政赤字 (十亿美元，负值表示赤字)
+def fetch_all_data():
+    """获取黄金及各因子数据"""
+    tickers = {
+        "黄金期货": "GC=F",
+        "美元指数": "DX-Y.NYB",
+        "10年期美债收益率": "^TNX",
+        "VIX恐慌指数": "^VIX",
+        "原油价格": "CL=F",
+        "白银价格": "SI=F",
+        "标普500": "^GSPC",
+        "美国国债ETF(TLT)": "TLT",
     }
-    frames = {}
-    for name, sid in series_map.items():
+
+    data = {}
+    for name, ticker in tickers.items():
         try:
-            s = fred.get_series(sid)
-            s.name = name
-            frames[name] = s
-        except Exception as e:
-            st.warning(f"获取 {name} 失败: {e}")
-    
-    # 合并数据，按日期对齐
-    df = pd.concat(frames.values(), axis=1).dropna()
-    return df
+            df = yf.download(ticker, period="2y", auto_adjust=True)
+            if not df.empty:
+                data[name] = df["Close"]
+        except:
+            pass
 
-# =========================
-# 因子计算
-# =========================
-def compute_factors(df: pd.DataFrame) -> pd.DataFrame:
-    factors = pd.DataFrame(index=df.index)
-    
-    # 1. 传统因子
-    factors["real_rate"] = -df["real_rate"] # 实际利率反向
-    factors["usd"] = -df["usd"].pct_change(60) # 美元60日跌幅
-    factors["inflation"] = df["cpi"].pct_change(12) # 通胀同比
-    factors["employment"] = -df["unemployment"].diff() + df["nonfarm"].pct_change() # 就业恶化程度
-    factors["economic_activity"] = df["gdp"].pct_change(4) # GDP增速
-    factors["market_sentiment"] = -df["vix"].pct_change(20) # 恐慌指数变化（通常VIX涨利好黄金，但这里取变化率平滑）
-    
-    # 2. 新增因子
-    # 央行购金：计算同比变化率，购金增加利好黄金
-    factors["central_bank"] = df["central_bank_gold"].pct_change(12)
-    
-    # 财政赤字：FRED数据中FYFSD通常是负数表示赤字。
-    # 逻辑：赤字扩大（数值更负）-> 利好黄金。
-    # 处理：取相反数，使赤字扩大时因子值为正。
-    factors["fiscal_deficit"] = -df["fiscal_deficit"].pct_change(4) # 4季度变化率
-    
-    return factors.dropna()
+    return data
 
-def zscore(s: pd.Series, window: int = 180) -> pd.Series:
-    return (s - s.rolling(window, min_periods=24).mean()) / s.rolling(window, min_periods=24).std()
 
-def build_signal(factors: pd.DataFrame, weights: dict, window: int = 180) -> pd.DataFrame:
-    z = factors.apply(zscore, window=window)
-    # 确保权重字典只包含因子中存在的列
-    valid_weights = {k: v for k, v in weights.items() if k in z.columns}
-    score = sum(z[k] * v for k, v in valid_weights.items())
-    
-    out = factors[["gold"]].copy()
-    out["gold_ret"] = out["gold"].pct_change()
-    out["score"] = score
-    return out.dropna()
+@st.cache_data(ttl=3600)
+def build_analysis_df(data):
+    """构建因子分析 DataFrame"""
+    df = pd.DataFrame(data)
+    df = df.dropna()
 
-# =========================
-# 回测引擎
-# =========================
-def simple_backtest(base: pd.DataFrame, threshold: float = 0.5):
-    sig = np.where(base["score"] > threshold, 1, np.where(base["score"] < -threshold, -1, 0))
-    pos = pd.Series(sig, index=base.index).replace(0, method="ffill").fillna(0)
-    strat_ret = pos.shift(1) * base["gold_ret"]
-    equity = (1 + strat_ret).cumprod()
-    trades = strat_ret[strat_ret != 0]
-    return {"equity": equity, "trades": trades, "positions": pos}
+    # 计算各因子的日收益率
+    returns = df.pct_change().dropna()
 
-def calc_metrics(equity: pd.Series, trades: pd.Series):
-    total_ret = equity.iloc[-1] / equity.iloc[0] - 1
-    sharpe = trades.mean() / trades.std() * np.sqrt(252) if trades.std() > 0 else 0
-    max_dd = (equity / equity.cummax() - 1).min()
-    win_rate = (trades > 0).mean() if len(trades) > 0 else 0
-    return {"累计收益": total_ret, "Sharpe": sharpe, "最大回撤": max_dd, "胜率": win_rate}
+    # 计算滚动相关系数（60日窗口）
+    rolling_corr = {}
+    gold_returns = returns["黄金期货"]
+    for col in returns.columns:
+        if col != "黄金期货":
+            rolling_corr[col] = gold_returns.rolling(60).corr(returns[col])
 
-# =========================
-# 智能分析报告生成器
-# =========================
-def generate_analysis_report(base: pd.DataFrame, metrics: dict, weights: dict):
-    if base.empty or not metrics:
-        return "数据不足，无法生成分析报告。"
+    corr_df = pd.DataFrame(rolling_corr)
 
-    latest_score = base["score"].iloc[-1]
-    latest_date = base.index[-1].strftime("%Y-%m-%d")
-    latest_gold = base["gold"].iloc[-1]
+    return df, returns, corr_df
 
-    # 1. 趋势诊断
-    if latest_score > 1.0:
-        trend = "🔥 **强势多头趋势**"
-        trend_desc = "综合得分显著高于历史均值，宏观与新因子共振强烈支撑黄金。"
-    elif latest_score > 0.5:
-        trend = "📈 **温和偏多趋势**"
-        trend_desc = "综合得分处于偏多区间，具备上行动能。"
-    elif latest_score > -0.5:
-        trend = "⚖️ **中性震荡趋势"
-        trend_desc = "多空力量均衡，可能维持区间震荡。"
-    elif latest_score > -1.0:
-        trend = "📉 **温和偏空趋势**"
-        trend_desc = "综合得分处于偏空区间，宏观环境形成压制。"
-    else:
-        trend = "❄️ **强势空头趋势**"
-        trend_desc = "综合得分极低，市场情绪悲观或实际利率大幅走高。"
 
-    # 2. 核心驱动因子分析
-    # 重新计算Z-score用于解释
-    factors_only = base.drop(columns=["gold", "gold_ret", "score"])
-    z = (factors_only - factors_only.rolling(180, min_periods=24).mean()) / factors_only.rolling(180, min_periods=24).std()
-    
-    latest_z = z.iloc[-1]
-    valid_weights = {k: v for k, v in weights.items() if k in latest_z.index}
-    contributions = latest_z * pd.Series(valid_weights)
-    
-    top_positive = contributions.nlargest(2)
-    top_negative = contributions.nsmallest(2)
+# ==========================================
+# 多因子综合评分
+# ==========================================
+def compute_factor_score(returns, lookback=60):
+    """
+    计算多因子综合评分
+    逻辑：
+    - 美元指数、美债收益率：与金价负相关 → 它们下跌时利多黄金
+    - VIX、原油、白银：与金价正相关 → 它们上涨时利多黄金
+    """
+    recent = returns.tail(lookback)
 
-    driver_analysis = "**主要多头贡献：**\n"
-    has_pos = False
-    for factor, val in top_positive.items():
-        if val > 0:
-            driver_analysis += f"- 🟢 **{factor}** (贡献度: +{val:.3f})\n"
-            has_pos = True
-    if not has_pos: driver_analysis += "- 无明显正向驱动\n"
+    scores = {}
 
-    driver_analysis += "\n**主要空头拖累：**\n"
-    has_neg = False
-    for factor, val in top_negative.items():
-        if val < 0:
-            driver_analysis += f"- 🔴 **{factor}** (贡献度: {val:.3f})\n"
-            has_neg = True
-    if not has_neg: driver_analysis += "- 无明显负向拖累\n"
+    # 美元指数：下跌利多黄金
+    if "美元指数" in recent.columns:
+        usd_change = recent["美元指数"].iloc[-1] - recent["美元指数"].iloc[0]
+        scores["美元指数"] = -usd_change * 100  # 取反
 
-    # 3. 策略表现评估
-    sharpe = metrics.get("Sharpe", 0)
-    max_dd = metrics.get("最大回撤", 0)
+    # 美债收益率：上升利空黄金
+    if "10年期美债收益率" in recent.columns:
+        bond_change = recent["10年期美债收益率"].iloc[-1] - recent["10年期美债收益率"].iloc[0]
+        scores["10年期美债收益率"] = -bond_change
 
-    if sharpe > 1.5 and max_dd > -0.15:
-        strategy_rating = "🌟 **优秀**：风险收益比极佳。"
-    elif sharpe > 0.8:
-        strategy_rating = "👍 **良好**：表现稳健。"
-    elif sharpe > 0:
-        strategy_rating = "⚠️ **一般**：收益勉强覆盖风险。"
-    else:
-        strategy_rating = "❌ **较差**：策略失效。"
+    # VIX恐慌指数：上升利多黄金（避险）
+    if "VIX恐慌指数" in recent.columns:
+        vix_change = recent["VIX恐慌指数"].iloc[-1] - recent["VIX恐慌指数"].iloc[0]
+        scores["VIX恐慌指数"] = vix_change * 0.5
 
-    # 4. 综合建议
-    if latest_score > 0.5 and sharpe > 0.8:
-        advice = "💡 **操作参考**：趋势向上且策略有效，可考虑逢低做多。"
-    elif latest_score < -0.5:
-        advice = "💡 **操作参考**：趋势向下，建议规避多头风险。"
-    else:
-        advice = "💡 **操作参考**：信号不明确，建议观望。"
+    # 原油：上涨利多黄金（通胀预期）
+    if "原油价格" in recent.columns:
+        oil_change = recent["原油价格"].iloc[-1] - recent["原油价格"].iloc[0]
+        scores["原油价格"] = oil_change * 0.1
 
-    report = f"""
-### 📊 黄金多因子智能分析报告 ({latest_date})
+    # 白银：上涨利多黄金（贵金属联动）
+    if "白银价格" in recent.columns:
+        silver_change = recent["白银价格"].iloc[-1] - recent["白银价格"].iloc[0]
+        scores["白银价格"] = silver_change * 0.5
 
-**1. 市场趋势诊断**
-- **当前状态**：{trend}
-- **状态解析**：{trend_desc}
-- **最新金价**：${latest_gold:.2f} | **综合得分**：{latest_score:.3f}
+    # 标普500：下跌利多黄金（避险）
+    if "标普500" in recent.columns:
+        sp_change = recent["标普500"].iloc[-1] - recent["标普500"].iloc[0]
+        scores["标普500"] = -sp_change * 0.1
 
-**2. 核心驱动因子分析**
-{driver_analysis}
+    # 美债ETF(TLT)：上涨利多黄金（利率下行预期）
+    if "美国国债ETF(TLT)" in recent.columns:
+        tlt_change = recent["美国国债ETF(TLT)"].iloc[-1] - recent["美国国债ETF(TLT)"].iloc[0]
+        scores["美国国债ETF(TLT)"] = tlt_change * 2
 
-**3. 历史回测策略评估**
-- **累计收益**：{metrics.get('累计收益', 0):.2%} | **胜率**：{metrics.get('胜率', 0):.2%}
-- **策略评级**：{strategy_rating}
+    return scores
 
-**4. 综合操作建议**
-{advice}
 
-> ⚠️ *免责声明：本报告由量化模型自动生成，仅供研究参考。*
-"""
-    return report
-
-# =========================
-# 绘图
-# =========================
-def plot_signal(base: pd.DataFrame):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-    axes[0].plot(base.index, base["gold"], color="gold", linewidth=1.5)
-    axes[0].set_title("Gold Price", color="white")
-    axes[0].set_facecolor("#1a1a2e")
-    axes[0].tick_params(colors="white")
-    
-    axes[1].plot(base.index, base["score"], color="cyan", linewidth=1.2)
-    axes[1].axhline(0.5, color="lime", ls="--", lw=0.8)
-    axes[1].axhline(-0.5, color="red", ls="--", lw=0.8)
-    axes[1].fill_between(base.index, base["score"], 0, where=base["score"] > 0, alpha=0.3, color="lime")
-    axes[1].fill_between(base.index, base["score"], 0, where=base["score"] < 0, alpha=0.3, color="red")
-    axes[1].set_title("Composite Score", color="white")
-    axes[1].set_facecolor("#1a1a2e")
-    axes[1].tick_params(colors="white")
-    
-    fig.patch.set_facecolor("#0e1117")
-    plt.tight_layout()
-    return fig
-
-def plot_backtest(result: dict):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-    axes[0].plot(result["equity"].index, result["equity"], color="lime", linewidth=1.5)
-    axes[0].set_title("Equity Curve", color="white")
-    axes[0].set_facecolor("#1a1a2e")
-    axes[0].tick_params(colors="white")
-    
-    dd = result["equity"] / result["equity"].cummax() - 1
-    axes[1].fill_between(dd.index, dd, 0, color="red", alpha=0.5)
-    axes[1].set_title("Drawdown", color="white")
-    axes[1].set_facecolor("#1a1a2e")
-    axes[1].tick_params(colors="white")
-    
-    fig.patch.set_facecolor("#0e1117")
-    plt.tight_layout()
-    return fig
-
-# =========================
+# ==========================================
 # 主程序
-# =========================
-def main():
-    st.set_page_config(page_title="Gold Factor Model Pro", layout="wide")
-    st.title("🏆 黄金多因子量化分析系统 (含央行与赤字因子)")
+# ==========================================
+st.title("🥇 黄金多因子趋势分析系统")
+st.markdown("基于宏观经济因子，量化分析黄金价格趋势方向")
 
-    with st.sidebar:
-        st.header("参数设置")
-        api_key = st.text_input("FRED API Key", value=FRED_API_KEY, type="password")
-        weight_scheme = st.selectbox("权重方案", list(WEIGHT_GRID.keys()))
-        threshold = st.slider("信号阈值", -1.0, 1.0, 0.5, 0.1)
-        run = st.button("🚀 运行分析", type="primary")
+# 获取数据
+with st.spinner("正在从 Yahoo Finance 获取数据..."):
+    raw_data = fetch_all_data()
 
-    if run and api_key:
-        with st.spinner("正在获取数据并计算..."):
-            raw = fetch_all_data(api_key)
-            factors = compute_factors(raw)
-            weights = WEIGHT_GRID[weight_scheme]
-            base = build_signal(factors, weights)
-            result = simple_backtest(base, threshold)
-            metrics = calc_metrics(result["equity"], result["trades"])
-            st.session_state.update({
-                "base": base, "result": result,
-                "metrics": metrics, "weights": weights,
-            })
+if not raw_data:
+    st.error("数据获取失败，请稍后刷新重试。")
+    st.stop()
 
-    if "base" in st.session_state:
-        base = st.session_state["base"]
-        metrics = st.session_state["metrics"]
-        weights = st.session_state["weights"]
-        latest_score = base["score"].iloc[-1]
-        signal_text = "🟢 偏多" if latest_score > threshold else "🔴 偏空" if latest_score < -threshold else "⚪ 中性"
+df, returns, corr_df = build_analysis_df(raw_data)
 
-        # 指标卡片
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("综合得分", f"{latest_score:.3f}")
-        col2.metric("信号方向", signal_text)
-        col3.metric("最新金价", f"${base['gold'].iloc[-1]:.2f}")
-        col4.metric("Sharpe", f"{metrics['Sharpe']:.2f}")
+# ==========================================
+# 侧边栏参数设置
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ 参数设置")
+    lookback = st.slider("评分回看窗口（交易日）", 20, 120, 60, step=10)
+    corr_window = st.slider("相关性计算窗口（交易日）", 20, 120, 60, step=10)
 
-        # 智能分析报告
-        st.markdown("---")
-        report_text = generate_analysis_report(base, metrics, weights)
-        st.markdown(report_text)
+# ==========================================
+# 模块一：黄金价格走势 + 因子对比
+# ==========================================
+st.header("📈 黄金价格与各因子走势对比")
 
-        # 图表
-        st.markdown("---")
-        st.subheader("信号走势图")
-        fig_signal = plot_signal(base)
-        st.pyplot(fig_signal)
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                    subplot_titles=("黄金期货价格", "各因子归一化走势"),
+                    vertical_spacing=0.08, row_heights=[0.4, 0.6])
 
-        st.subheader("回测净值与回撤")
-        fig_bt = plot_backtest(st.session_state["result"])
-        st.pyplot(fig_bt)
+# 黄金价格
+gold = df["黄金期货"]
+fig.add_trace(
+    go.Scatter(x=gold.index, y=gold.values, name="黄金",
+               line=dict(color="gold", width=2)),
+    row=1, col=1
+)
 
-        # 回测指标表
-        st.subheader("回测指标")
-        st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "数值"}))
+# 各因子归一化走势
+for col in df.columns:
+    if col != "黄金期货":
+        normalized = (df[col] - df[col].mean()) / df[col].std()
+        fig.add_trace(
+            go.Scatter(x=normalized.index, y=normalized.values, name=col,
+                       line=dict(width=1), opacity=0.7),
+            row=2, col=1
+        )
 
-if __name__ == "__main__":
-    main()
+fig.update_layout(height=700, template="plotly_white",
+                  legend=dict(orientation="h", y=-0.15))
+st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================
+# 模块二：因子相关性热力图
+# ==========================================
+st.header("🔗 因子相关性分析")
+
+# 重新计算指定窗口的相关性
+gold_ret = returns["黄金期货"]
+corr_matrix = {}
+for col in returns.columns:
+    if col != "黄金期货":
+        corr_matrix[col] = gold_ret.rolling(corr_window).corr(returns[col])
+corr_matrix_df = pd.DataFrame(corr_matrix)
+
+# 最新相关系数
+latest_corr = corr_matrix_df.iloc[-1].sort_values(ascending=False)
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("当前各因子与金价的相关系数")
+    corr_display = pd.DataFrame({
+        "因子": latest_corr.index,
+        "相关系数": latest_corr.values,
+        "方向": ["利多 ✅" if v > 0.3 else "利空 ❌" if v < -0.3 else "中性 ➖" for v in latest_corr.values]
+    })
+    st.dataframe(corr_display, hide_index=True, use_container_width=True)
+
+with col2:
+    st.subheader("滚动相关系数变化（近60日窗口）")
+    fig_corr = go.Figure()
+    for col in corr_matrix_df.columns:
+        fig_corr.add_trace(
+            go.Scatter(x=corr_matrix_df.index, y=corr_matrix_df[col],
+                       name=col, line=dict(width=1.5))
+        )
+    fig_corr.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig_corr.update_layout(height=400, template="plotly_white",
+                           yaxis_title="与黄金的相关系数")
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+# ==========================================
+# 模块三：多因子综合评分与趋势信号
+# ==========================================
+st.header("📊 多因子综合评分")
+
+scores = compute_factor_score(returns, lookback=lookback)
+total_score = sum(scores.values())
+
+# 趋势信号判断
+if total_score > 1:
+    signal = "🟢 偏多（看涨）"
+    signal_color = "green"
+elif total_score < -1:
+    signal = "🔴 偏空（看跌）"
+    signal_color = "red"
+else:
+    signal = "🟡 震荡（中性）"
+    signal_color = "orange"
+
+# 显示核心指标
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("综合因子得分", f"{total_score:.2f}")
+with col2:
+    st.metric("趋势信号", signal)
+with col3:
+    latest_gold = df["黄金期货"].iloc[-1]
+    gold_change = (df["黄金期货"].iloc[-1] / df["黄金期货"].iloc[-lookback] - 1) * 100
+    st.metric("黄金近况", f"${latest_gold:.2f}", f"{gold_change:+.1f}%")
+
+# 各因子贡献度柱状图
+st.subheader("各因子贡献度拆解")
+
+factor_names = list(scores.keys())
+factor_values = list(scores.values())
+colors = ["#2ecc71" if v > 0 else "#e74c3c" for v in factor_values]
+
+fig_bar = go.Figure()
+fig_bar.add_trace(go.Bar(
+    x=factor_names,
+    y=factor_values,
+    marker_color=colors,
+    text=[f"{v:+.2f}" for v in factor_values],
+    textposition="outside"
+))
+fig_bar.add_hline(y=0, line_dash="dash", line_color="gray")
+fig_bar.update_layout(
+    height=400,
+    template="plotly_white",
+    yaxis_title="贡献得分（正=利多，负=利空）",
+    title=f"回看 {lookback} 个交易日各因子对黄金的影响"
+)
+st.plotly_chart(fig_bar, use_container_width=True)
+
+# ==========================================
+# 模块四：综合评分历史走势
+# ==========================================
+st.header("📉 综合评分历史走势")
+
+# 滚动计算历史评分
+rolling_scores = []
+for i in range(lookback, len(returns)):
+    window_returns = returns.iloc[i - lookback:i]
+    s = compute_factor_score(window_returns, lookback=lookback)
+    rolling_scores.append(sum(s.values()))
+
+score_series = pd.Series(rolling_scores, index=returns.index[lookback:])
+
+fig_score = go.Figure()
+fig_score.add_trace(go.Scatter(
+    x=score_series.index, y=score_series.values,
+    name="综合评分", fill="tozeroy",
+    line=dict(color="gold", width=2),
+    fillcolor="rgba(255, 215, 0, 0.1)"
+))
+fig_score.add_hline(y=0, line_dash="dash", line_color="gray")
+fig_score.add_hline(y=1, line_dash="dot", line_color="green", annotation_text="偏多线")
+fig_score.add_hline(y=-1, line_dash="dot", line_color="red", annotation_text="偏空线")
+fig_score.update_layout(
+    height=400, template="plotly_white",
+    yaxis_title="综合因子得分",
+    title="评分 > 0 偏多 | 评分 < 0 偏空"
+)
+st.plotly_chart(fig_score, use_container_width=True)
+
+# ==========================================
+# 模块五：原始数据查看
+# ==========================================
+with st.expander("📋 查看原始数据"):
+    tab1, tab2 = st.tabs(["各因子收盘价", "各因子日收益率"])
+    with tab1:
+        st.dataframe(df.tail(30), use_container_width=True)
+    with tab2:
+        st.dataframe(returns.tail(30), use_container_width=True)
+
+# ==========================================
+# 底部说明
+# ==========================================
+st.divider()
+st.markdown("""
+**⚠️ 免责声明**：本工具仅供学习和研究使用，不构成任何投资建议。
+因子分析基于历史数据的统计关系，过去的相关性不代表未来表现。
+数据来源：Yahoo Finance（免费，无需 API Key）。
+""")

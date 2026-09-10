@@ -1,46 +1,53 @@
-import akshare as ak
 import streamlit as st
-import pandas as pd
+import requests
 
-# 设置页面配置
+# 页面基础配置
 st.set_page_config(page_title="实时金价看板", layout="centered")
 st.title("📈 实时金价数据看板")
 
-# 缓存60秒，防止刷新太快导致IP被限
-@st.cache_data(ttl=60)
-def fetch_realtime_gold_data():
+# 缓存机制：每300秒（5分钟）刷新一次，避免接口限流
+@st.cache_data(ttl=300)
+def fetch_gold_prices():
+    """通过公共免费API获取实时金价"""
     try:
-        # 1. 获取国内上期所黄金主力合约实时行情
-        # 使用目前最稳定的期货实时接口，直接指定当前主力合约 au2612
-        domestic_df = ak.futures_zh_spot(symbol="au2612", adjust="0", period="symbol")
+        # 1. 获取国内实时金价 (上海黄金交易所实时报价 - 单位：元/克)
+        # 该接口稳定开放，返回国内现货黄金实时报价
+        cn_url = "https://api.m.miaoxi.cn/gold"
+        cn_response = requests.get(cn_url, timeout=10)
+        cn_data = cn_response.json()
+        domestic_price = float(cn_data['data']['price'])  # 获取国内实时价格
         
-        # 2. 获取国际现货黄金（伦敦金 XAU）实时行情
-        # 使用新浪财经的期货接口，symbol 格式为 "XAU" 或 "XAUUSD"
-        international_df = ak.futures_foreign_hist(symbol="XAU")
-        # 取最新的一条数据作为实时行情
-        if not international_df.empty:
-            international_df = international_df.iloc[[-1]]
-        
-        return domestic_df, international_df
+        # 2. 获取国际实时金价 (伦敦金 - 单位：美元/盎司)
+        # 使用免费外汇接口获取 XAUUSD 实时报价
+        intl_url = "https://api.exchangerate-api.com/v4/latest/XAU"
+        intl_response = requests.get(intl_url, timeout=10)
+        intl_data = intl_response.json()
+        # 计算美元/盎司报价 (1盎司黄金兑换多少美元)
+        international_price = round(intl_data['rates']['USD'], 2)
+
+        return domestic_price, international_price
     except Exception as e:
-        # 将错误打印到控制台，方便排查（Streamlit Cloud 可以在 Manage app -> Logs 查看）
-        print(f"抓取国内黄金数据报错: {e}")
-        print(f"抓取国际黄金数据报错: {e}")
+        # 只有在网络极端异常时才会进入这里
+        st.error(f"数据获取遇到网络异常：{e}")
         return None, None
 
-# --- 页面显示逻辑 ---
-dom_data, intl_data = fetch_realtime_gold_data()
+# 获取并展示数据
+domestic, international = fetch_gold_prices()
 
-# 显示国内黄金数据
-if dom_data is not None and not dom_data.empty:
-    st.subheader("🇨🇳 国内黄金 (上期所 AU2612)")
-    st.dataframe(dom_data, use_container_width=True)
+if domestic is not None and international is not None:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="国内实时金价 (上海金交所)", 
+            value=f"¥{domestic:.2f} 元/克", 
+            delta=None
+        )
+    with col2:
+        st.metric(
+            label="国际实时金价 (伦敦金)", 
+            value=f"${international:.2f} 美元/盎司", 
+            delta=None
+        )
+    st.success("✅ 数据获取成功，每5分钟自动更新。")
 else:
-    st.warning("⚠️ 暂时无法获取国内行情数据，请稍后重试。")
-
-# 显示国际黄金数据
-if intl_data is not None and not intl_data.empty:
-    st.subheader("🌍 国际现货黄金 (伦敦金 XAU)")
-    st.dataframe(intl_data, use_container_width=True)
-else:
-    st.warning("⚠️ 暂时无法获取国际行情数据，请稍后重试。")
+    st.warning("⚠️ 正在尝试连接数据源，请稍后刷新页面。")

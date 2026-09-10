@@ -1,8 +1,45 @@
+# =============================================================================
+# requirements.txt —— 用于 Streamlit 社区云（Community Cloud）自建网址运行
+# 项目：金价每日速报生成器（gold-model）
+#
+# 【放置位置】GitHub 仓库根目录，与 streamlit_app.py / gold_price_report.py 同级。
+# 【命名要求】文件名必须一字不差是 requirements.txt（全小写、单数、.txt），
+#             写成 requirement.txt / requirements.TXT / Requirements.txt 都不会被读取，
+#             这是"部署后白屏 + ModuleNotFoundError"最常见的原因。
+#
+# 【Streamlit 社区云部署三步】
+#   1. 仓库根目录放三个文件：streamlit_app.py（网页入口）、gold_price_report.py（核心模块）、
+#      requirements.txt（本文件）。入口脚本名建议用 streamlit_app.py 或 app.py，
+#      部署时可在 "Settings → App entry point / 入口文件" 里手动指定。
+#   2. 打开 https://share.streamlit.io/deploy → 登录 GitHub → New app →
+#      选 Repository / Branch / Main file path(选 streamlit_app.py) → Deploy。
+#   3. 构建日志里若出现 "Installing requirements" 说明本文件已被正确识别；
+#      没有出现这一行 = 文件名或位置不对。
+#
+# 【注意事项】
+#   - 不要写 streamlit 以外的安装器指令（如 --index-url、-e .、pip install xxx），
+#     社区云用受限的 pip 环境解析，写了会直接构建失败。
+#   - 不要写本地绝对路径、不要写 git+https 的大依赖，冷启动会超时。
+#   - 社区云跑在免费容器里，实例闲置后会休眠，再次访问冷启动约 10~30 秒，属正常现象。
+#   - 依赖装不上时，先删掉带版本区间的约束（把 >= 那一行改成只写包名）再重新部署。
+# =============================================================================
 
-streamlit
-yfinance
-pandas
-numpy
-plotly
-requests
-beautifulsoup4
+# ---- 网页界面框架（必需）：Streamlit 社区云的宿主框架 --------------------------
+# 上限锁 <2.0 是为防止未来 2.x 的 API 破坏式变更导致应用直接起不来
+streamlit>=1.36,<2.0
+
+# ---- 表格录入与读写（必需）：界面里的可编辑表格、CSV 导入导出依赖 pandas --------
+pandas>=2.0,<3.0
+
+# ---- PDF 渲染（必需）：导出《金价每日速报》A4 PDF 靠它 -------------------------
+# 若只想在网页上看 Prompt/Markdown、不需要 PDF，可删除本行；
+# 删除后界面里点 PDF 导出会提示缺依赖，其余功能不受影响。
+reportlab>=4.0,<5.0
+
+# ---- 可选依赖：按需打开注释（去掉行首的 # 即可） ------------------------------
+# 想在网页里额外导出"趋势长图"PNG 时打开：
+# matplotlib>=3.8,<4.0
+# 想把报告数据同时导出成 Excel 台账时打开：
+# openpyxl>=3.1,<4.0
+# 想读取上传的 Excel 行情表而不是手填时打开：
+# xlrd>=2.0,<3.0
